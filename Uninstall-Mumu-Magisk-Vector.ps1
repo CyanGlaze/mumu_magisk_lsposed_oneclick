@@ -27,7 +27,7 @@ if ($Device -match '^[0-9]{1,3}(?:\.[0-9]{1,3}){3}$') { $Device += ":5555" }
 if ($Device -notmatch '^[0-9]{1,3}(?:\.[0-9]{1,3}){3}:[0-9]{1,5}$') { throw "设备地址格式无效。" }
 
 if (-not $Force) {
-    Write-Host "此操作将移除手工 Magisk 启动项，并标记 NeoZygisk/Vector 模块删除。"
+    Write-Host "此操作将移除手工 Magisk 启动项、官方 NeoZygisk/Vector 模块和系统 Magisk 兼容启动器，并恢复安装前备份的 KernelSU userspace。"
     $answer = Read-Host "输入 YES 继续"
     if ($answer -ne "YES") { exit 1 }
 }
@@ -50,7 +50,22 @@ for root in /data/adb/modules /data/adb/modules_update; do
 done
 rm -f /system/etc/init/magisk.rc
 rm -f /data/adb/magisk_init.sh
+if grep -q 'MUMU_MAGISK_COMPAT_LAUNCHER_v1.0.1' /system/bin/magisk 2>/dev/null; then
+    rm -f /system/bin/magisk
+    if [ -e /data/adb/mumu-magisk-backup/system-bin-magisk ]; then
+        cp -af /data/adb/mumu-magisk-backup/system-bin-magisk /system/bin/magisk
+        chmod 0755 /system/bin/magisk 2>/dev/null || true
+        restorecon /system/bin/magisk 2>/dev/null || true
+    fi
+fi
 rm -rf /data/adb/magisk
+rm -rf /data/adb/neozygisk /data/adb/neozygisk-mumu-guard
+if [ ! -e /data/adb/ksud ] && [ ! -L /data/adb/ksud ] && { [ -e /data/adb/mumu-magisk-backup/ksud ] || [ -L /data/adb/mumu-magisk-backup/ksud ]; }; then
+    cp -af /data/adb/mumu-magisk-backup/ksud /data/adb/ksud
+    chmod 0700 /data/adb/ksud 2>/dev/null || true
+    restorecon /data/adb/ksud 2>/dev/null || true
+fi
+rm -rf /data/adb/mumu-magisk-backup
 sync
 '@
 $tmp = Join-Path $env:TEMP "mumu-magisk-uninstall.sh"
@@ -63,4 +78,4 @@ if ($UninstallManager) {
     & $adb -s $Device uninstall com.topjohnwu.magisk | Out-Host
 }
 & $adb -s $Device reboot | Out-Host
-Write-Host "已提交卸载并重启。若之前存在自定义 magisk.rc，请从 backups 目录手动恢复。"
+Write-Host "已提交卸载并重启。卸载器会恢复安装前备份的 /system/bin/magisk 与 /data/adb/ksud（如有）。"

@@ -24,7 +24,7 @@ $LogRoot = Join-Path $ScriptRoot "logs"
 $BackupRoot = Join-Path $ScriptRoot "backups"
 $ConfigRoot = Join-Path $ScriptRoot "config"
 $DeviceConfigPath = Join-Path $ConfigRoot "last-device.txt"
-$ToolVersion = "1.0"
+$ToolVersion = "1.0.1"
 $Device = ""
 $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $HostLog = Join-Path $LogRoot "install-$Stamp.log"
@@ -401,7 +401,7 @@ function Get-GitHubReleaseAsset {
         [Parameter(Mandatory = $true)][string]$OutputName
     )
     $headers = @{
-        "User-Agent" = "Mumu-Magisk-LSPosed-OneClick/1.0"
+        "User-Agent" = "Mumu-Magisk-LSPosed-OneClick/1.0.1"
         "Accept" = "application/vnd.github+json"
         "X-GitHub-Api-Version" = "2022-11-28"
     }
@@ -445,6 +445,13 @@ function Get-GitHubReleaseAsset {
             Fail "SHA-256 校验失败：$($asset.name)"
         }
         Write-Step "SHA-256 校验通过"
+    } elseif ($null -ne $asset.PSObject.Properties["size"]) {
+        $actualSize = (Get-Item -LiteralPath $target).Length
+        if ($actualSize -ne [int64]$asset.size) {
+            Remove-Item -Force -LiteralPath $target
+            Fail "资产大小校验失败：$($asset.name)"
+        }
+        Write-Step "GitHub 资产大小校验通过"
     }
     return $target
 }
@@ -632,13 +639,23 @@ if ([string]::IsNullOrWhiteSpace($MagiskApk)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($NeoZygiskZip)) {
-    $NeoZygiskZip = Get-GitHubReleaseAsset -Repository "JingMatrix/NeoZygisk" -OutputName "NeoZygisk-latest.zip" -Selector {
-        $_.name -match "\.zip$" -and $_.name -notmatch "(?i)debug|source"
+    # 不内置、也不重新打包 NeoZygisk。优先使用用户放入 packages 的官方 ZIP；
+    # 未提供离线包时，直接从 JingMatrix/NeoZygisk 最新稳定版下载官方 release 资产。
+    $offlineNeoZygisk = Join-Path $ScriptRoot "packages\NeoZygisk.zip"
+    if (Test-Path -LiteralPath $offlineNeoZygisk) {
+        $NeoZygiskZip = (Resolve-Path -LiteralPath $offlineNeoZygisk).Path
+        Write-Step "使用 packages\NeoZygisk.zip 离线包（安装器不会修改该 ZIP）"
+    } else {
+        $NeoZygiskZip = Get-GitHubReleaseAsset -Repository "JingMatrix/NeoZygisk" -OutputName "NeoZygisk-latest.zip" -Selector {
+            $_.name -match "^NeoZygisk-v.+-release\.zip$" -and $_.name -notmatch "(?i)debug|source|symbols"
+        }
+        Write-Step "使用 NeoZygisk 官方最新稳定版 release 资产（在线下载，不内置）"
     }
 } elseif (-not (Test-Path -LiteralPath $NeoZygiskZip)) {
     Fail "找不到 NeoZygisk ZIP：$NeoZygiskZip"
 } else {
     $NeoZygiskZip = (Resolve-Path -LiteralPath $NeoZygiskZip).Path
+    Write-Step "使用用户指定的 NeoZygisk ZIP（安装器不会修改该 ZIP）"
 }
 
 if ([string]::IsNullOrWhiteSpace($VectorZip)) {
@@ -689,7 +706,16 @@ function Test-ModuleArchive {
 
 $neoModuleId = Test-ModuleArchive -Path $NeoZygiskZip -DisplayName "NeoZygisk"
 $vectorModuleId = Test-ModuleArchive -Path $VectorZip -DisplayName "Vector"
-Write-Step "模块 ZIP 预检通过：NeoZygisk=$neoModuleId，Vector=$vectorModuleId"
+if ($neoModuleId -ne "zygisksu") {
+    Fail "NeoZygisk 模块 ID 应为 zygisksu，实际为：$neoModuleId"
+}
+if ($vectorModuleId -ne "zygisk_vector") {
+    Fail "Vector 模块 ID 应为 zygisk_vector，实际为：$vectorModuleId"
+}
+$neoArchiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $NeoZygiskZip).Hash.ToLowerInvariant()
+$vectorArchiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $VectorZip).Hash.ToLowerInvariant()
+Write-Step "模块 ZIP 预检通过：NeoZygisk=$neoModuleId SHA256=$neoArchiveHash；Vector=$vectorModuleId SHA256=$vectorArchiveHash"
+Write-Step "NeoZygisk 原始 ZIP 将直接交给 Magisk 官方模块安装入口，不做重打包或脚本替换"
 
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $StageRoot
 New-Item -ItemType Directory -Force -Path $StageRoot | Out-Null
@@ -758,7 +784,7 @@ try {
     }
 
     if ($null -eq $selectedAbi) {
-        Fail "APK 内的 Magisk 二进制都无法在当前 Mumu 实例执行。可通过 -MagiskApk 指定已验证的 Magisk 30.6 APK。"
+        Fail "APK 内的 Magisk 二进制都无法在当前 Mumu 实例执行。可通过 -MagiskApk 指定与当前实例兼容的 Magisk APK。"
     }
 
     # 不只提取三个常驻二进制。Magisk 的模块安装入口会检查
@@ -857,6 +883,22 @@ on property:sys.boot_completed=1
     exec u:r:su:s0 root root -- /debug_ramdisk/magisk --boot-complete
 '@
 
+$magiskCompatText = @'
+#!/system/bin/sh
+# MUMU_MAGISK_COMPAT_LAUNCHER_v1.0.1
+# Keep Magisk discoverable in Android's standard PATH so official NeoZygisk can use
+# Magisk as its sole userspace root implementation. KernelSU userspace is separately
+# quarantined by magisk_init.sh; this launcher also makes recent KernelSU skip modules.
+if [ -x /debug_ramdisk/magisk ]; then
+    exec /debug_ramdisk/magisk "$@"
+fi
+if [ -x /data/adb/magisk/magisk ]; then
+    exec /data/adb/magisk/magisk "$@"
+fi
+echo "Mumu Magisk runtime is not ready" >&2
+exit 127
+'@
+
 $initText = @'
 #!/system/bin/sh
 export MAGISKTMP=/debug_ramdisk
@@ -868,7 +910,35 @@ log() {
     echo "[$(date '+%F %T')] $*" >> "$LOG"
 }
 
+# MuMu keeps the KernelSU kernel interface available even after its Root toggle is off.
+# Official NeoZygisk treats KernelSU + Magisk as conflicting root implementations when
+# /data/adb/ksud is still present. Preserve the original ksud once, then keep that path
+# absent before Magisk runs module post-fs-data scripts.
+PERSIST_BACKUP=/data/adb/mumu-magisk-backup
+quarantine_ksu_userspace() {
+    mkdir -p "$PERSIST_BACKUP" || return 1
+    if [ -e /data/adb/ksud ] || [ -L /data/adb/ksud ]; then
+        if [ ! -e "$PERSIST_BACKUP/ksud" ] && [ ! -L "$PERSIST_BACKUP/ksud" ]; then
+            if ! mv /data/adb/ksud "$PERSIST_BACKUP/ksud" 2>>"$LOG"; then
+                cp -af /data/adb/ksud "$PERSIST_BACKUP/ksud" 2>>"$LOG" || return 1
+                rm -rf /data/adb/ksud 2>>"$LOG" || return 1
+            fi
+            chmod 0700 "$PERSIST_BACKUP/ksud" 2>/dev/null || true
+            log "Backed up and quarantined KernelSU userspace daemon"
+        else
+            rm -rf /data/adb/ksud 2>>"$LOG" || return 1
+            log "Removed a restored KernelSU userspace daemon; original backup retained"
+        fi
+    fi
+    if [ -e /data/adb/ksud ] || [ -L /data/adb/ksud ]; then
+        return 1
+    fi
+    log "Root implementation boundary ready: Magisk only"
+    return 0
+}
+
 log "Starting Magisk initialization"
+quarantine_ksu_userspace || { log "ERROR: unable to quarantine /data/adb/ksud"; exit 1; }
 [ -x "$MAGISKBIN/magisk" ] || { log "Missing $MAGISKBIN/magisk"; exit 1; }
 
 mkdir -p "$MAGISKTMP/.magisk/device" "$MAGISKTMP/.magisk/worker"
@@ -921,6 +991,22 @@ if [ -d /sys/fs/selinux ]; then
     fi
 fi
 
+# MUMU_MODULE_SEPOLICY_FIX_BEGIN
+# MuMu live setup does not replace Android init with magiskinit. Load enabled
+# module sepolicy.rule files before Magisk runs post-fs-data module scripts.
+# NeoZygisk needs these rules for its ptrace-based Zygote injection.
+for module_dir in /data/adb/modules/* /data/adb/modules_update/*; do
+    [ -d "$module_dir" ] || continue
+    [ -f "$module_dir/disable" ] && continue
+    [ -f "$module_dir/remove" ] && continue
+    [ -r "$module_dir/sepolicy.rule" ] || continue
+    log "Applying module sepolicy: $module_dir/sepolicy.rule"
+    if ! "$MAGISKTMP/magiskpolicy" --live --apply "$module_dir/sepolicy.rule" >> "$LOG" 2>&1; then
+        log "WARNING: failed to apply $module_dir/sepolicy.rule"
+    fi
+done
+# MUMU_MODULE_SEPOLICY_FIX_END
+
 log "Magisk initialization complete"
 exit 0
 '@
@@ -944,11 +1030,32 @@ log "Checking root"
 id | grep -q 'uid=0' || fail "adbd is not root"
 
 BACKUP=/data/local/tmp/mumu_magisk_backup
+PERSIST_BACKUP=/data/adb/mumu-magisk-backup
 rm -rf "$BACKUP"
-mkdir -p "$BACKUP"
+mkdir -p "$BACKUP" "$PERSIST_BACKUP"
 [ -f /system/etc/init/magisk.rc ] && cp -af /system/etc/init/magisk.rc "$BACKUP/magisk.rc.old"
 [ -f /data/adb/magisk_init.sh ] && cp -af /data/adb/magisk_init.sh "$BACKUP/magisk_init.sh.old"
 [ -f /data/adb/magisk.db ] && cp -af /data/adb/magisk.db "$BACKUP/magisk.db.old"
+if [ -e /system/bin/magisk ] && ! grep -q 'MUMU_MAGISK_COMPAT_LAUNCHER_v1.0.1' /system/bin/magisk 2>/dev/null; then
+    rm -rf "$PERSIST_BACKUP/system-bin-magisk"
+    cp -af /system/bin/magisk "$PERSIST_BACKUP/system-bin-magisk" || fail "backup existing /system/bin/magisk"
+    log "Backed up existing /system/bin/magisk"
+fi
+
+# Closing MuMu's Root switch does not remove the KernelSU kernel interface. NeoZygisk
+# also requires /data/adb/ksud for KernelSU detection, so make that path absent while
+# preserving the original executable for uninstall/rollback.
+if [ -e /data/adb/ksud ] || [ -L /data/adb/ksud ]; then
+    if [ ! -e "$PERSIST_BACKUP/ksud" ] && [ ! -L "$PERSIST_BACKUP/ksud" ]; then
+        mv /data/adb/ksud "$PERSIST_BACKUP/ksud" || fail "backup and quarantine /data/adb/ksud"
+        chmod 0700 "$PERSIST_BACKUP/ksud" 2>/dev/null || true
+        log "Backed up and quarantined KernelSU userspace daemon"
+    else
+        rm -rf /data/adb/ksud || fail "remove restored /data/adb/ksud"
+        log "Removed restored KernelSU userspace daemon; original backup retained"
+    fi
+fi
+[ ! -e /data/adb/ksud ] && [ ! -L /data/adb/ksud ] || fail "KernelSU userspace path still exists"
 
 mkdir -p /data/adb/magisk || fail "cannot create /data/adb/magisk"
 
@@ -973,10 +1080,13 @@ grep -q '^MAGISK_VER_CODE=' /data/adb/magisk/util_functions.sh || fail "util_fun
 
 cp -af /data/local/tmp/magisk.rc /system/etc/init/magisk.rc || fail "install magisk.rc"
 cp -af /data/local/tmp/magisk_init.sh /data/adb/magisk_init.sh || fail "install magisk_init.sh"
+cp -af /data/local/tmp/magisk-compat /system/bin/magisk || fail "install /system/bin/magisk compatibility launcher"
 chmod 0644 /system/etc/init/magisk.rc
-chmod 0755 /data/adb/magisk_init.sh
-chown root:root /system/etc/init/magisk.rc /data/adb/magisk_init.sh /data/adb/magisk/* 2>/dev/null || true
-restorecon /system/etc/init/magisk.rc /data/adb/magisk_init.sh /data/adb/magisk/* 2>/dev/null || true
+chmod 0755 /data/adb/magisk_init.sh /system/bin/magisk
+chown root:root /system/etc/init/magisk.rc /data/adb/magisk_init.sh /system/bin/magisk /data/adb/magisk/* 2>/dev/null || true
+restorecon /system/etc/init/magisk.rc /data/adb/magisk_init.sh /system/bin/magisk /data/adb/magisk/* 2>/dev/null || true
+grep -q 'MUMU_MAGISK_COMPAT_LAUNCHER_v1.0.1' /system/bin/magisk || fail "compatibility launcher marker missing"
+log "Installed Magisk compatibility launcher; KernelSU userspace is quarantined so NeoZygisk detects Magisk only"
 
 [ -x /debug_ramdisk/magisk ] && /debug_ramdisk/magisk --stop 2>/dev/null || true
 mkdir -p /debug_ramdisk
@@ -1009,6 +1119,10 @@ install_module_zip() {
     [ -n "$modid" ] || fail "$name module.prop/id missing"
     log "Installing $name (id=$modid)"
 
+    # 完整重装：清除上一次未完成的更新目录，避免旧文件与新模块混装。
+    rm -rf "/data/adb/modules_update/$modid"
+    rm -f "/data/adb/modules/$modid/disable" "/data/adb/modules/$modid/remove" 2>/dev/null || true
+
     # 首选 Magisk 官方入口。若某个版本的 CLI 环境检查仍不兼容手工 live setup，
     # 直接执行同一份官方 util_functions.sh 作为等价回退，并保留完整输出。
     if ! /debug_ramdisk/magisk --install-module "$zipfile"; then
@@ -1025,15 +1139,34 @@ install_module_zip() {
 install_module_zip "NeoZygisk" /data/local/tmp/NeoZygisk.zip
 install_module_zip "Vector" /data/local/tmp/Vector.zip
 
+# NeoZygisk ZIP is installed as supplied. Duplicate execution is prevented at the
+# root-framework boundary by /system/bin/magisk, not by changing third-party files.
+NEODIR=""
+[ -d /data/adb/modules_update/zygisksu ] && NEODIR=/data/adb/modules_update/zygisksu
+[ -z "$NEODIR" ] && [ -d /data/adb/modules/zygisksu ] && NEODIR=/data/adb/modules/zygisksu
+[ -n "$NEODIR" ] || fail "NeoZygisk module directory missing after install"
+[ -s "$NEODIR/post-fs-data.sh" ] || fail "NeoZygisk post-fs-data.sh missing after install"
+[ -s "$NEODIR/service.sh" ] || fail "NeoZygisk service.sh missing after install"
+for d in /data/adb/modules/zygisksu /data/adb/modules_update/zygisksu /data/adb/modules/zygisk_vector /data/adb/modules_update/zygisk_vector; do
+    [ -d "$d" ] || continue
+    rm -f "$d/disable" "$d/remove"
+done
+rm -rf /data/adb/neozygisk-mumu-guard 2>/dev/null || true
+log "Official NeoZygisk module staged without modifying its scripts"
+log "Root conflict prevention: /data/adb/ksud quarantined; /system/bin/magisk remains the only detected userspace root"
+log "Duplicate module execution prevention is provided by the system Magisk compatibility launcher"
+
 log "Installation staged successfully. Reboot is required."
 exit 0
 '@
 
 $rcPath = Join-Path $WorkRoot "magisk.rc"
 $initPath = Join-Path $WorkRoot "magisk_init.sh"
+$magiskCompatPath = Join-Path $WorkRoot "magisk-compat"
 $remoteInstallerPath = Join-Path $WorkRoot "mumu-magisk-install.sh"
 Write-Utf8NoBom -Path $rcPath -Content $rcText
 Write-Utf8NoBom -Path $initPath -Content $initText
+Write-Utf8NoBom -Path $magiskCompatPath -Content $magiskCompatText
 Write-Utf8NoBom -Path $remoteInstallerPath -Content $remoteInstallText
 
 Write-Step "上传 Magisk 文件和模块"
@@ -1045,10 +1178,11 @@ Get-ChildItem -LiteralPath $StageRoot -File | ForEach-Object {
 }
 Invoke-Adb -Arguments @("push", $rcPath, "/data/local/tmp/magisk.rc") -Quiet | Out-Null
 Invoke-Adb -Arguments @("push", $initPath, "/data/local/tmp/magisk_init.sh") -Quiet | Out-Null
+Invoke-Adb -Arguments @("push", $magiskCompatPath, "/data/local/tmp/magisk-compat") -Quiet | Out-Null
 Invoke-Adb -Arguments @("push", $remoteInstallerPath, "/data/local/tmp/mumu-magisk-install.sh") -Quiet | Out-Null
 Invoke-Adb -Arguments @("push", $NeoZygiskZip, "/data/local/tmp/NeoZygisk.zip") -Quiet | Out-Null
 Invoke-Adb -Arguments @("push", $VectorZip, "/data/local/tmp/Vector.zip") -Quiet | Out-Null
-Invoke-Adb -Arguments @("shell", "chmod", "0755", "/data/local/tmp/mumu-magisk-install.sh", "/data/local/tmp/magisk_init.sh", "/data/local/tmp/mumu_magisk_stage/busybox") -Quiet | Out-Null
+Invoke-Adb -Arguments @("shell", "chmod", "0755", "/data/local/tmp/mumu-magisk-install.sh", "/data/local/tmp/magisk_init.sh", "/data/local/tmp/magisk-compat", "/data/local/tmp/mumu_magisk_stage/busybox") -Quiet | Out-Null
 
 # 先在临时目录验证官方 Magisk 模块安装运行时；此阶段尚未改写 /system 或 /data/adb。
 Write-Step "在设备端预检 Magisk 完整运行时"
@@ -1062,6 +1196,7 @@ if ($runtimeVersionCheck.Output -notmatch "MAGISK_VER_CODE=") {
 # This catches quoting/syntax regressions while the operation is still reversible.
 Write-Step "在设备端执行 shell 语法检查"
 Invoke-Adb -Arguments @("shell", "sh", "-n", "/data/local/tmp/magisk_init.sh") -Quiet | Out-Null
+Invoke-Adb -Arguments @("shell", "sh", "-n", "/data/local/tmp/magisk-compat") -Quiet | Out-Null
 Invoke-Adb -Arguments @("shell", "sh", "-n", "/data/local/tmp/mumu-magisk-install.sh") -Quiet | Out-Null
 
 Write-Step "执行远端安装（沿用已验证的 /system 写入通道：$script:SystemWriteChannel）"
@@ -1123,23 +1258,69 @@ $magiskVersion = Invoke-Adb -Arguments @("shell", "/debug_ramdisk/magisk", "-v")
 $suCheck = Invoke-Adb -Arguments @("shell", "/debug_ramdisk/su", "-c", "id") -AllowFail
 
 Write-Step "验证 NeoZygisk / Vector"
-$moduleCheck = Invoke-Adb -Arguments @("shell", "/debug_ramdisk/su", "-c", 'for f in /data/adb/modules/*/module.prop; do echo ====$f; cat $f; done') -AllowFail
-$unloaded = Invoke-Adb -Arguments @("shell", "/debug_ramdisk/su", "-c", "find /data/adb/modules -path '*/zygisk/unloaded' -print 2>/dev/null") -AllowFail
-$processes = Invoke-Adb -Arguments @("shell", "ps -A | grep -Ei 'neozygisk|zygiskd|lspd|lsposed|vector' || true") -AllowFail
-$lspd = Invoke-Adb -Arguments @("shell", "/debug_ramdisk/su", "-c", "ls -la /data/adb/lspd 2>/dev/null") -AllowFail
+$verifyModulesPath = Join-Path $WorkRoot "mumu-verify-modules.sh"
+$verifyModulesText = @'
+#!/system/bin/sh
+
+echo "===== module metadata ====="
+for f in /data/adb/modules/*/module.prop; do
+    [ -f "$f" ] || continue
+    echo "====$f"
+    cat "$f"
+done
+
+echo "===== unloaded markers ====="
+find /data/adb/modules -path '*/zygisk/unloaded' -print 2>/dev/null || true
+
+echo "===== root implementation boundary ====="
+if [ -e /data/adb/ksud ] || [ -L /data/adb/ksud ]; then
+    echo "ERROR: /data/adb/ksud still exists"
+    ls -lZ /data/adb/ksud 2>/dev/null || ls -l /data/adb/ksud 2>/dev/null || true
+else
+    echo "KernelSU userspace: quarantined"
+fi
+if [ -e /data/adb/mumu-magisk-backup/ksud ] || [ -L /data/adb/mumu-magisk-backup/ksud ]; then
+    echo "KernelSU backup: present"
+    ls -lZ /data/adb/mumu-magisk-backup/ksud 2>/dev/null || ls -l /data/adb/mumu-magisk-backup/ksud 2>/dev/null || true
+fi
+
+echo "===== Magisk compatibility launcher ====="
+ls -lZ /system/bin/magisk 2>/dev/null || ls -l /system/bin/magisk 2>/dev/null || true
+grep 'MUMU_MAGISK_COMPAT_LAUNCHER_v1.0.1' /system/bin/magisk 2>/dev/null || true
+/system/bin/magisk -v 2>/dev/null || true
+/system/bin/magisk -V 2>/dev/null || true
+
+echo "===== NeoZygisk runtime status ====="
+cat /data/adb/neozygisk/module.prop 2>/dev/null || true
+
+echo "===== init tracer and monitor count ====="
+grep '^TracerPid:' /proc/1/status 2>/dev/null || true
+ps -A -o NAME,ARGS 2>/dev/null | grep -c '[z]ygisk-ptrace.*monitor' 2>/dev/null || true
+
+echo "===== process topology ====="
+ps -A -o USER,PID,PPID,NAME,ARGS 2>/dev/null || ps -A -o USER,PID,PPID,NAME,CMD 2>/dev/null || ps -A
+
+echo "===== Vector LSPosed data ====="
+ls -la /data/adb/lspd 2>/dev/null || true
+'@
+Write-Utf8NoBom -Path $verifyModulesPath -Content $verifyModulesText
+Invoke-Adb -Arguments @("push", $verifyModulesPath, "/data/local/tmp/mumu-verify-modules.sh") -Quiet | Out-Null
+Invoke-Adb -Arguments @("shell", "chmod", "0755", "/data/local/tmp/mumu-verify-modules.sh") -Quiet | Out-Null
+$frameworkCheck = Invoke-Adb -Arguments @("shell", "/debug_ramdisk/su", "-c", "/data/local/tmp/mumu-verify-modules.sh") -AllowFail
 
 Write-Host ""
 Write-Host "================ 安装结果 ================"
 Write-Host "Magisk: $($magiskVersion.Output)"
 Write-Host "SU: $($suCheck.Output)"
-if (-not [string]::IsNullOrWhiteSpace($unloaded.Output)) {
-    Write-Host "发现不兼容 Zygisk 库："
-    Write-Host $unloaded.Output
-}
-if ($lspd.Code -eq 0 -and -not [string]::IsNullOrWhiteSpace($lspd.Output)) {
-    Write-Host "Vector/LSPosed 数据目录已生成，框架大概率已激活。"
+Write-Host $frameworkCheck.Output
+$neoStatusLine = ($frameworkCheck.Output -split "`r?`n" | Where-Object { $_ -match 'zygote64:' } | Select-Object -First 1)
+if (-not [string]::IsNullOrWhiteSpace($neoStatusLine) -and $neoStatusLine -match 'injected' -and $neoStatusLine -notmatch 'not injected') {
+    Write-Host "NeoZygisk 注入检查通过。" -ForegroundColor Green
+} elseif (-not [string]::IsNullOrWhiteSpace($neoStatusLine)) {
+    Write-Host "NeoZygisk 当前状态：$neoStatusLine" -ForegroundColor Yellow
+    Write-Host "请完成下方的 MuMu Root 切换和第二次重启。本版本会备份并隔离 /data/adb/ksud，使官方 NeoZygisk 只检测到 Magisk；不会修改 NeoZygisk。" -ForegroundColor Yellow
 } else {
-    Write-Host "尚未检测到 /data/adb/lspd。请查看日志目录中的诊断信息；可能需要再重启一次。"
+    Write-Host "尚未生成 NeoZygisk 运行时状态；完成第二次重启后再检查。" -ForegroundColor Yellow
 }
 Write-Host "主机日志：$HostLog"
 Write-Host "设备日志：/data/local/tmp/mumu-magisk-oneclick.log 和 /data/local/tmp/magisk_init.log"
@@ -1154,12 +1335,12 @@ if ($managerCheck.Code -eq 0 -and $managerCheck.Output -match "package:") {
 
 Write-Host ""
 Write-Host "================ 请在 Magisk 中完成 ================" -ForegroundColor Cyan
-Write-Host "1. 打开“模块”页面，开启 NeoZygisk（Zygisk）。"
+Write-Host "1. 打开 模块页面，开启 NeoZygisk（Zygisk）。"
 Write-Host "2. 开启 Vector（LSPosed）。"
 Write-Host "3. 本方案使用 NeoZygisk，请不要同时开启 Magisk 设置页里的内置 Zygisk。"
-Write-Host "4. 在 Mumu 中关闭 Root 权限：设备设置 -> 开发者选项 -> Root 权限。"
 Write-Host ""
 Write-Host "================ 请在 Mumu 中完成 ================" -ForegroundColor Cyan
 Write-Host "1. 返回当前设备窗口。"
-Write-Host "2. 点击重启设备，不要在 Magisk 中重启。"
-Write-Host "3. 重启完成后，再打开 NeoZygisk 和 Vector 检查状态。"
+Write-Host "2. 确认两个模块均为启用状态后，再在 Mumu 中关闭 Root 权限：设备设置 -> 开发者选项 -> Root 权限。"
+Write-Host "3. 点击重启设备，不要在 Magisk 中重启。"
+Write-Host "4. 重启完成后打开 NeoZygisk 检查状态；正常应为 zygote64: injected，且系统中只有一个 monitor。安装器下载并原样安装官方 NeoZygisk。"
