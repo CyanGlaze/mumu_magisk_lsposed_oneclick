@@ -1,0 +1,6 @@
+logs/
+packages/
+.workbuddy/
+/backups
+/work
+/config
